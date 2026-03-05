@@ -15,9 +15,7 @@ const API_URL =
   import.meta.env.VITE_API_URL ||
   "https://ahpyzgvdacfpvxnssmxt.supabase.co/functions/v1/ai-chat";
 
-const ANON_KEY =
-  import.meta.env.VITE_SUPABASE_ANON_KEY ||
-  "***REDACTED***";
+const ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
 
 async function sendPrompt(prompt: string): Promise<ChatResponse> {
   return Sentry.startSpan(
