@@ -3,26 +3,23 @@
 // https://docs.sentry.io/platforms/javascript/guides/deno/configuration/integrations/vercelai/
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import * as Sentry from "npm:@sentry/deno@^10.40.0";
+import * as Sentry from "npm:@sentry/deno@^10.42.0";
 import { generateText, tool, stepCountIs } from "npm:ai@^6.0.0";
 import { openai } from "npm:@ai-sdk/openai@^3.0.0";
 import { z } from "npm:zod@^4.1.8";
 
-// ─── TRACING SETUP ──────────────────────────────────────────────────────────
-// Traces capture the full request lifecycle: HTTP → LLM calls → tool executions
-// Each trace shows timing, token counts, and prompt/response content per span
-// Sample rate controls what % of requests get full traces
+// Workaround: Supabase Edge Runtime pre-registers an OTel TracerProvider,
+// which prevents Sentry from registering its own. Remove it before Sentry.init().
+// TODO: Remove after @sentry/deno ships the trace.disable() fix.
+delete (globalThis as any)[Symbol.for("opentelemetry.js.api.1")];
+
 Sentry.init({
   dsn: Deno.env.get("SENTRY_DSN"),
+  debug: true,
   tracesSampleRate: 1.0, // Use 0.1–0.2 in production
   sendDefaultPii: true,
   enableLogs: true,
-  integrations: [
-    Sentry.vercelAIIntegration({
-      recordInputs: true,
-      recordOutputs: true,
-    }),
-  ],
+  integrations: [Sentry.vercelAIIntegration()],
 });
 
 const SIMULATED_USERS = [
@@ -152,7 +149,7 @@ const lookupProduct = tool({
   },
 });
 
-Deno.serve(async (req) => {
+Deno.serve((req) => {
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers":
@@ -164,7 +161,11 @@ Deno.serve(async (req) => {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
-  {
+  const sentryTrace = req.headers.get("sentry-trace") ?? "";
+  const baggage = req.headers.get("baggage") ?? "";
+
+  return Sentry.continueTrace({ sentryTrace, baggage }, () => {
+    return Sentry.withIsolationScope(async () => {
       const startTime = performance.now();
       const user =
         SIMULATED_USERS[Math.floor(Math.random() * SIMULATED_USERS.length)];
@@ -182,36 +183,25 @@ Deno.serve(async (req) => {
         if (!prompt) {
           return new Response(JSON.stringify({ error: "prompt is required" }), {
             status: 400,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
+            headers: {
+              ...corsHeaders,
+              "Content-Type": "application/json",
+            },
           });
         }
 
-        // ─── TRACING: AI SDK telemetry ──────────────────────────────────────
-        // This flag creates spans for each LLM call and tool execution
-        // Combined with vercelAIIntegration above, gives full agent trace visibility
-        const result = await Sentry.startSpan(
-          {
-            name: "support-agent",
-            op: "ai_pipeline:agent",
-            attributes: {
-              "gen_ai.agent.name": "support-agent",
-            },
+        const result = await generateText({
+          model: openai(model),
+          system:
+            "You are a helpful assistant with access to a user database, order history, and product catalog. Use the available tools to answer questions.",
+          prompt,
+          tools: { lookupUser, lookupOrder, lookupProduct },
+          stopWhen: stepCountIs(5),
+          experimental_telemetry: {
+            isEnabled: true,
+            functionId: "support-agent",
           },
-          async () => {
-            return await generateText({
-              model: openai(model),
-              system:
-                "You are a helpful assistant with access to a user database, order history, and product catalog. Use the available tools to answer questions.",
-              prompt,
-              tools: { lookupUser, lookupOrder, lookupProduct },
-              stopWhen: stepCountIs(5),
-              experimental_telemetry: {
-                isEnabled: true,
-                functionId: "ai-chat-test",
-              },
-            });
-          },
-        );
+        });
 
         const durationMs = performance.now() - startTime;
         const promptTokens = result.totalUsage?.inputTokens ?? 0;
@@ -226,10 +216,7 @@ Deno.serve(async (req) => {
         const allToolCalls = result.steps.flatMap((s) => s.toolCalls ?? []);
         const attributes = { model, user_id: user.id };
 
-        // ─── METRICS ────────────────────────────────────────────────────────
-        // Metrics are aggregated numbers — always 100% sample rate (very cheap)
-        // Use for dashboards, alerts, and trend analysis over time
-        // count = how many, distribution = spread (p50/p95/p99), gauge = current state
+        // ─── METRICS ───────────────────────────────────────────────────
         Sentry.metrics.distribution("ai.request.duration", durationMs, {
           unit: "millisecond",
           attributes,
@@ -257,10 +244,7 @@ Deno.serve(async (req) => {
           attributes,
         });
 
-        // ─── LOGS ──────────────────────────────────────────────────────────
-        // Structured logs capture a summary of every request — always 100%
-        // Each field is queryable: filter by user_id, tools_used, cost, etc.
-        // Unlike traces (flow), logs record WHAT happened with all the numbers
+        // ─── LOGS ──────────────────────────────────────────────────────
         const sendDefaultPii = Sentry.getClient()?.getOptions().sendDefaultPii;
         Sentry.logger.info("ai-chat request completed", {
           user_id: user.id,
@@ -279,7 +263,9 @@ Deno.serve(async (req) => {
           tools_used: [...new Set(allToolCalls.map((tc) => tc.toolName))].join(
             ", ",
           ),
-          tool_call_sequence: allToolCalls.map((tc) => tc.toolName).join(" → "),
+          tool_call_sequence: allToolCalls
+            .map((tc) => tc.toolName)
+            .join(" -> "),
           ...(sendDefaultPii && { prompt: prompt.slice(0, 200) }),
         });
 
@@ -289,7 +275,7 @@ Deno.serve(async (req) => {
             steps: stepCount,
             toolCalls: allToolCalls.map((tc) => ({
               tool: tc.toolName,
-              args: tc.args,
+              args: tc.input,
             })),
             usage: {
               promptTokens,
@@ -299,13 +285,16 @@ Deno.serve(async (req) => {
             },
             durationMs: Math.round(durationMs),
           }),
-          { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          {
+            headers: {
+              ...corsHeaders,
+              "Content-Type": "application/json",
+            },
+          },
         );
       } catch (error) {
         const durationMs = performance.now() - startTime;
 
-        // ─── ERROR: Metrics + Logs ────────────────────────────────────────
-        // Errors always get both a metric (for alerting) and a log (for debugging)
         Sentry.metrics.count("ai.request.error", 1, {
           attributes: {
             model,
@@ -327,11 +316,15 @@ Deno.serve(async (req) => {
           JSON.stringify({ error: "Internal server error" }),
           {
             status: 500,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
+            headers: {
+              ...corsHeaders,
+              "Content-Type": "application/json",
+            },
           },
         );
       } finally {
         await Sentry.flush(2000);
       }
-  }
+    });
+  });
 });
