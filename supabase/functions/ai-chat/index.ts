@@ -3,15 +3,10 @@
 // https://docs.sentry.io/platforms/javascript/guides/deno/configuration/integrations/vercelai/
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import * as Sentry from "npm:@sentry/deno@^10.42.0";
+import * as Sentry from "npm:@sentry/deno@^10.45.0";
 import { generateText, tool, stepCountIs } from "npm:ai@^6.0.0";
 import { openai } from "npm:@ai-sdk/openai@^3.0.0";
 import { z } from "npm:zod@^4.1.8";
-
-// Workaround: Supabase Edge Runtime pre-registers an OTel TracerProvider,
-// which prevents Sentry from registering its own. Remove it before Sentry.init().
-// TODO: Remove after @sentry/deno ships the trace.disable() fix.
-delete (globalThis as any)[Symbol.for("opentelemetry.js.api.1")];
 
 Sentry.init({
   dsn: Deno.env.get("SENTRY_DSN"),
