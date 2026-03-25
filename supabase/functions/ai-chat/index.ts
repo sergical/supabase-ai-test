@@ -3,10 +3,17 @@
 // https://docs.sentry.io/platforms/javascript/guides/deno/configuration/integrations/vercelai/
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import * as Sentry from "npm:@sentry/deno@^10.45.0";
+import * as Sentry from "@sentry/deno";
 import { generateText, tool, stepCountIs } from "npm:ai@^6.0.0";
 import { openai } from "npm:@ai-sdk/openai@^3.0.0";
 import { z } from "npm:zod@^4.1.8";
+
+// Workaround: Supabase Edge Runtime pre-registers an OTel global with a version
+// that's incompatible with @sentry/deno's @opentelemetry/api, causing
+// trace.setGlobalTracerProvider() to silently fail. Nuke the entire global
+// so Sentry can register its own TracerProvider cleanly.
+// See: https://github.com/getsentry/sentry-javascript/pull/19723
+delete (globalThis as any)[Symbol.for("opentelemetry.js.api.1")];
 
 Sentry.init({
   dsn: Deno.env.get("SENTRY_DSN"),
@@ -144,7 +151,9 @@ const lookupProduct = tool({
   },
 });
 
-Deno.serve((req) => {
+// denoServeIntegration handles continueTrace + withIsolationScope automatically.
+// Don't double-wrap — nested scopes break OTel span parenting.
+Deno.serve(async (req) => {
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers":
@@ -156,170 +165,152 @@ Deno.serve((req) => {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
-  const sentryTrace = req.headers.get("sentry-trace") ?? "";
-  const baggage = req.headers.get("baggage") ?? "";
+  const startTime = performance.now();
+  const user =
+    SIMULATED_USERS[Math.floor(Math.random() * SIMULATED_USERS.length)];
+  const model = "gpt-4o-mini";
 
-  return Sentry.continueTrace({ sentryTrace, baggage }, () => {
-    return Sentry.withIsolationScope(async () => {
-      const startTime = performance.now();
-      const user =
-        SIMULATED_USERS[Math.floor(Math.random() * SIMULATED_USERS.length)];
-      const model = "gpt-4o-mini";
-
-      Sentry.setUser({
-        id: user.id,
-        username: user.username,
-        email: user.email,
-      });
-
-      try {
-        const { prompt } = await req.json();
-
-        if (!prompt) {
-          return new Response(JSON.stringify({ error: "prompt is required" }), {
-            status: 400,
-            headers: {
-              ...corsHeaders,
-              "Content-Type": "application/json",
-            },
-          });
-        }
-
-        const result = await generateText({
-          model: openai(model),
-          system:
-            "You are a helpful assistant with access to a user database, order history, and product catalog. Use the available tools to answer questions.",
-          prompt,
-          tools: { lookupUser, lookupOrder, lookupProduct },
-          stopWhen: stepCountIs(5),
-          experimental_telemetry: {
-            isEnabled: true,
-            functionId: "support-agent",
-          },
-        });
-
-        const durationMs = performance.now() - startTime;
-        const promptTokens = result.totalUsage?.inputTokens ?? 0;
-        const completionTokens = result.totalUsage?.outputTokens ?? 0;
-        const totalTokens = promptTokens + completionTokens;
-        const cost = estimateCost(promptTokens, completionTokens);
-        const finishReason = result.finishReason ?? "unknown";
-        const tokenEfficiency =
-          promptTokens > 0 ? completionTokens / promptTokens : 0;
-        const stepCount = result.steps.length;
-
-        const allToolCalls = result.steps.flatMap((s) => s.toolCalls ?? []);
-        const attributes = { model, user_id: user.id };
-
-        // ─── METRICS ───────────────────────────────────────────────────
-        Sentry.metrics.distribution("ai.request.duration", durationMs, {
-          unit: "millisecond",
-          attributes,
-        });
-        Sentry.metrics.distribution("ai.tokens.prompt", promptTokens, {
-          attributes,
-        });
-        Sentry.metrics.distribution("ai.tokens.completion", completionTokens, {
-          attributes,
-        });
-        Sentry.metrics.distribution("ai.tokens.total", totalTokens, {
-          attributes,
-        });
-        Sentry.metrics.count("ai.request.count", 1, {
-          attributes: { ...attributes, finish_reason: finishReason },
-        });
-        Sentry.metrics.distribution("ai.cost", cost, {
-          unit: "dollar",
-          attributes,
-        });
-        Sentry.metrics.gauge("ai.tokens.efficiency", tokenEfficiency, {
-          attributes,
-        });
-        Sentry.metrics.distribution("ai.request.steps", stepCount, {
-          attributes,
-        });
-
-        // ─── LOGS ──────────────────────────────────────────────────────
-        const sendDefaultPii = Sentry.getClient()?.getOptions().sendDefaultPii;
-        Sentry.logger.info("ai-chat request completed", {
-          user_id: user.id,
-          model,
-          prompt_length: prompt.length,
-          response_length: result.text.length,
-          prompt_tokens: promptTokens,
-          completion_tokens: completionTokens,
-          total_tokens: totalTokens,
-          duration_ms: Math.round(durationMs),
-          estimated_cost: cost,
-          finish_reason: finishReason,
-          token_efficiency: tokenEfficiency,
-          steps: stepCount,
-          tool_calls_count: allToolCalls.length,
-          tools_used: [...new Set(allToolCalls.map((tc) => tc.toolName))].join(
-            ", ",
-          ),
-          tool_call_sequence: allToolCalls
-            .map((tc) => tc.toolName)
-            .join(" -> "),
-          ...(sendDefaultPii && { prompt: prompt.slice(0, 200) }),
-        });
-
-        return new Response(
-          JSON.stringify({
-            text: result.text,
-            steps: stepCount,
-            toolCalls: allToolCalls.map((tc) => ({
-              tool: tc.toolName,
-              args: tc.input,
-            })),
-            usage: {
-              promptTokens,
-              completionTokens,
-              totalTokens,
-              estimatedCost: cost,
-            },
-            durationMs: Math.round(durationMs),
-          }),
-          {
-            headers: {
-              ...corsHeaders,
-              "Content-Type": "application/json",
-            },
-          },
-        );
-      } catch (error) {
-        const durationMs = performance.now() - startTime;
-
-        Sentry.metrics.count("ai.request.error", 1, {
-          attributes: {
-            model,
-            user_id: user.id,
-            error_type: error instanceof Error ? error.name : "Unknown",
-          },
-        });
-
-        Sentry.logger.error("ai-chat request failed", {
-          user_id: user.id,
-          model,
-          prompt_length: 0,
-          error_message: error instanceof Error ? error.message : String(error),
-          duration_ms: Math.round(durationMs),
-        });
-
-        Sentry.captureException(error);
-        return new Response(
-          JSON.stringify({ error: "Internal server error" }),
-          {
-            status: 500,
-            headers: {
-              ...corsHeaders,
-              "Content-Type": "application/json",
-            },
-          },
-        );
-      } finally {
-        await Sentry.flush(2000);
-      }
-    });
+  Sentry.setUser({
+    id: user.id,
+    username: user.username,
+    email: user.email,
   });
+
+  try {
+    const { prompt } = await req.json();
+
+    if (!prompt) {
+      return new Response(JSON.stringify({ error: "prompt is required" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const result = await generateText({
+      model: openai(model),
+      system:
+        "You are a helpful assistant with access to a user database, order history, and product catalog. Use the available tools to answer questions.",
+      prompt,
+      tools: { lookupUser, lookupOrder, lookupProduct },
+      stopWhen: stepCountIs(5),
+      experimental_telemetry: {
+        isEnabled: true,
+        functionId: "support-agent",
+      },
+    });
+
+    const durationMs = performance.now() - startTime;
+    const promptTokens = result.totalUsage?.inputTokens ?? 0;
+    const completionTokens = result.totalUsage?.outputTokens ?? 0;
+    const totalTokens = promptTokens + completionTokens;
+    const cost = estimateCost(promptTokens, completionTokens);
+    const finishReason = result.finishReason ?? "unknown";
+    const tokenEfficiency =
+      promptTokens > 0 ? completionTokens / promptTokens : 0;
+    const stepCount = result.steps.length;
+
+    const allToolCalls = result.steps.flatMap((s) => s.toolCalls ?? []);
+    const attributes = { model, user_id: user.id };
+
+    // ─── METRICS ───────────────────────────────────────────────────
+    Sentry.metrics.distribution("ai.request.duration", durationMs, {
+      unit: "millisecond",
+      attributes,
+    });
+    Sentry.metrics.distribution("ai.tokens.prompt", promptTokens, {
+      attributes,
+    });
+    Sentry.metrics.distribution("ai.tokens.completion", completionTokens, {
+      attributes,
+    });
+    Sentry.metrics.distribution("ai.tokens.total", totalTokens, {
+      attributes,
+    });
+    Sentry.metrics.count("ai.request.count", 1, {
+      attributes: { ...attributes, finish_reason: finishReason },
+    });
+    Sentry.metrics.distribution("ai.cost", cost, {
+      unit: "dollar",
+      attributes,
+    });
+    Sentry.metrics.gauge("ai.tokens.efficiency", tokenEfficiency, {
+      attributes,
+    });
+    Sentry.metrics.distribution("ai.request.steps", stepCount, {
+      attributes,
+    });
+
+    // ─── LOGS ──────────────────────────────────────────────────────
+    const sendDefaultPii = Sentry.getClient()?.getOptions().sendDefaultPii;
+    Sentry.logger.info("ai-chat request completed", {
+      user_id: user.id,
+      model,
+      prompt_length: prompt.length,
+      response_length: result.text.length,
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: totalTokens,
+      duration_ms: Math.round(durationMs),
+      estimated_cost: cost,
+      finish_reason: finishReason,
+      token_efficiency: tokenEfficiency,
+      steps: stepCount,
+      tool_calls_count: allToolCalls.length,
+      tools_used: [...new Set(allToolCalls.map((tc) => tc.toolName))].join(
+        ", ",
+      ),
+      tool_call_sequence: allToolCalls
+        .map((tc) => tc.toolName)
+        .join(" -> "),
+      ...(sendDefaultPii && { prompt: prompt.slice(0, 200) }),
+    });
+
+    return new Response(
+      JSON.stringify({
+        text: result.text,
+        steps: stepCount,
+        toolCalls: allToolCalls.map((tc) => ({
+          tool: tc.toolName,
+          args: tc.input,
+        })),
+        usage: {
+          promptTokens,
+          completionTokens,
+          totalTokens,
+          estimatedCost: cost,
+        },
+        durationMs: Math.round(durationMs),
+      }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
+  } catch (error) {
+    const durationMs = performance.now() - startTime;
+
+    Sentry.metrics.count("ai.request.error", 1, {
+      attributes: {
+        model,
+        user_id: user.id,
+        error_type: error instanceof Error ? error.name : "Unknown",
+      },
+    });
+
+    Sentry.logger.error("ai-chat request failed", {
+      user_id: user.id,
+      model,
+      prompt_length: 0,
+      error_message: error instanceof Error ? error.message : String(error),
+      duration_ms: Math.round(durationMs),
+    });
+
+    Sentry.captureException(error);
+    return new Response(
+      JSON.stringify({ error: "Internal server error" }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      },
+    );
+  } finally {
+    await Sentry.flush(2000);
+  }
 });
